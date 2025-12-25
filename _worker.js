@@ -6,11 +6,37 @@ function logError(request, message) {
   );
 }
 
+function isAllowed(request, env, url) {
+  const {
+    PATHNAME_REGEX,
+    UA_WHITELIST_REGEX,
+    UA_BLACKLIST_REGEX,
+    IP_WHITELIST_REGEX,
+    IP_BLACKLIST_REGEX,
+    REGION_WHITELIST_REGEX,
+    REGION_BLACKLIST_REGEX,
+  } = env;
+
+  const ua = (request.headers.get("user-agent") || "").toLowerCase();
+  const ip = request.headers.get("cf-connecting-ip") || "";
+  const region = request.headers.get("cf-ipcountry") || "";
+
+  if (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) return false;
+  if (UA_WHITELIST_REGEX && !new RegExp(UA_WHITELIST_REGEX).test(ua)) return false;
+  if (UA_BLACKLIST_REGEX && new RegExp(UA_BLACKLIST_REGEX).test(ua)) return false;
+  if (IP_WHITELIST_REGEX && !new RegExp(IP_WHITELIST_REGEX).test(ip)) return false;
+  if (IP_BLACKLIST_REGEX && new RegExp(IP_BLACKLIST_REGEX).test(ip)) return false;
+  if (REGION_WHITELIST_REGEX && !new RegExp(REGION_WHITELIST_REGEX).test(region)) return false;
+  if (REGION_BLACKLIST_REGEX && new RegExp(REGION_BLACKLIST_REGEX).test(region)) return false;
+
+  return true;
+}
+
 function createNewRequest(request, url, proxyHostname, originHostname) {
-  const newRequestHeaders = new Headers(request.headers);
-  for (const [key, value] of newRequestHeaders) {
+  const headers = new Headers(request.headers);
+  for (const [key, value] of headers) {
     if (value.includes(originHostname)) {
-      newRequestHeaders.set(
+      headers.set(
         key,
         value.replace(
           new RegExp(`(?<!\\.)\\b${originHostname}\\b`, "g"),
@@ -21,22 +47,17 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   }
   return new Request(url.toString(), {
     method: request.method,
-    headers: newRequestHeaders,
+    headers,
     body: request.body,
-    redirect: 'follow'
+    redirect: "follow",
   });
 }
 
-function setResponseHeaders(
-  originalResponse,
-  proxyHostname,
-  originHostname,
-  DEBUG
-) {
-  const newResponseHeaders = new Headers(originalResponse.headers);
-  for (const [key, value] of newResponseHeaders) {
+function setResponseHeaders(response, proxyHostname, originHostname, DEBUG) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of headers) {
     if (value.includes(proxyHostname)) {
-      newResponseHeaders.set(
+      headers.set(
         key,
         value.replace(
           new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
@@ -45,66 +66,71 @@ function setResponseHeaders(
       );
     }
   }
-  if (DEBUG) {
-    newResponseHeaders.delete("content-security-policy");
-  }
-  return newResponseHeaders;
+  if (DEBUG) headers.delete("content-security-policy");
+  return headers;
 }
 
-/**
- * 替换内容
- * @param originalResponse 响应
- * @param proxyHostname 代理地址 hostname
- * @param pathnameRegex 代理地址路径匹配的正则表达式
- * @param originHostname 替换的字符串
- * @returns {Promise<*>}
- */
-async function replaceResponseText(
-  originalResponse,
-  proxyHostname,
-  pathnameRegex,
-  originHostname
-) {
-  let text = await originalResponse.text();
+async function replaceResponseText(response, proxyHostname, pathnameRegex, originHostname) {
+  let text = await response.text();
   if (pathnameRegex) {
     pathnameRegex = pathnameRegex.replace(/^\^/, "");
     return text.replace(
       new RegExp(`((?<!\\.)\\b${proxyHostname}\\b)(${pathnameRegex})`, "g"),
       `${originHostname}$2`
     );
-  } else {
-    return text.replace(
-      new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
-      originHostname
-    );
   }
+  return text.replace(
+    new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
+    originHostname
+  );
 }
 
 async function nginx() {
   return `<!DOCTYPE html>
 <html>
-<head>
-<title>Welcome to nginx!</title>
-<style>
-html { color-scheme: light dark; }
-body { width: 35em; margin: 0 auto;
-font-family: Tahoma, Verdana, Arial, sans-serif; }
-</style>
-</head>
-<body>
-<h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and
-working. Further configuration is required.</p>
-
-<p>For online documentation and support please refer to
-<a href="http://nginx.org/">nginx.org</a>.<br/>
-Commercial support is available at
-<a href="http://nginx.com/">nginx.com</a>.</p>
-
-<p><em>Thank you for using nginx.</em></p>
-</body>
+<head><title>Welcome to nginx!</title></head>
+<body><h1>Welcome to nginx!</h1></body>
 </html>`;
 }
+
+/* ================= WebSocket 代理 ================= */
+
+async function handleWebSocket(request, targetUrl) {
+  const pair = new WebSocketPair();
+  const [client, worker] = Object.values(pair);
+
+  worker.accept();
+  const target = new WebSocket(targetUrl);
+
+  worker.addEventListener("message", (e) => {
+    if (target.readyState === WebSocket.OPEN) {
+      target.send(e.data);
+    }
+  });
+
+  target.addEventListener("message", (e) => {
+    if (worker.readyState === WebSocket.OPEN) {
+      worker.send(e.data);
+    }
+  });
+
+  const close = () => {
+    try { worker.close(); } catch {}
+    try { target.close(); } catch {}
+  };
+
+  worker.addEventListener("close", close);
+  worker.addEventListener("error", close);
+  target.addEventListener("close", close);
+  target.addEventListener("error", close);
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
+}
+
+/* ================= Worker 入口 ================= */
 
 export default {
   async fetch(request, env, ctx) {
@@ -112,93 +138,77 @@ export default {
       const {
         PROXY_HOSTNAME,
         PROXY_PROTOCOL = "https",
-        PATHNAME_REGEX,
-        UA_WHITELIST_REGEX,
-        UA_BLACKLIST_REGEX,
         URL302,
-        IP_WHITELIST_REGEX,
-        IP_BLACKLIST_REGEX,
-        REGION_WHITELIST_REGEX,
-        REGION_BLACKLIST_REGEX,
         KEEP_PATH = false,
         DEBUG = false,
       } = env;
+
+      if (!PROXY_HOSTNAME) return new Response("Missing PROXY_HOSTNAME", { status: 500 });
+
       const url = new URL(request.url);
-      const originHostname = url.hostname;
-      if (
-        !PROXY_HOSTNAME ||
-        (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
-        (UA_WHITELIST_REGEX &&
-          !new RegExp(UA_WHITELIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
-          )) ||
-        (UA_BLACKLIST_REGEX &&
-          new RegExp(UA_BLACKLIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
-          )) ||
-        (IP_WHITELIST_REGEX &&
-          !new RegExp(IP_WHITELIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
-          )) ||
-        (IP_BLACKLIST_REGEX &&
-          new RegExp(IP_BLACKLIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
-          )) ||
-        (REGION_WHITELIST_REGEX &&
-          !new RegExp(REGION_WHITELIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
-          )) ||
-        (REGION_BLACKLIST_REGEX &&
-          new RegExp(REGION_BLACKLIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
-          ))
-      ) {
+
+      /* ===== WebSocket ===== */
+      if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+        if (!isAllowed(request, env, url)) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        url.hostname = PROXY_HOSTNAME;
+        url.protocol = PROXY_PROTOCOL === "http" ? "ws:" : "wss:";
+
+        return handleWebSocket(request, url.toString());
+      }
+
+      /* ===== HTTP ===== */
+      if (!isAllowed(request, env, url)) {
         logError(request, "Invalid");
         return URL302
-          ? Response.redirect(KEEP_PATH
-            ? (URL302 + "/" + url.pathname).replace(/\/+/g, '/')
-            : URL302,
-             302
+          ? Response.redirect(
+              KEEP_PATH
+                ? (URL302 + "/" + url.pathname).replace(/\/+/g, "/")
+                : URL302,
+              302
             )
           : new Response(await nginx(), {
-              headers: {
-                "Content-Type": "text/html; charset=utf-8",
-              },
+              headers: { "Content-Type": "text/html; charset=utf-8" },
             });
       }
-      url.host = PROXY_HOSTNAME;
+
+      const originHostname = url.hostname;
+      url.hostname = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
+
       const newRequest = createNewRequest(
         request,
         url,
         PROXY_HOSTNAME,
         originHostname
       );
+
       const originalResponse = await fetch(newRequest);
-      const newResponseHeaders = setResponseHeaders(
+      const headers = setResponseHeaders(
         originalResponse,
         PROXY_HOSTNAME,
         originHostname,
         DEBUG
       );
-      const contentType = newResponseHeaders.get("content-type") || "";
-      let body;
-      if (contentType.includes("text/")) {
-        body = await replaceResponseText(
-          originalResponse,
-          PROXY_HOSTNAME,
-          PATHNAME_REGEX,
-          originHostname
-        );
-      } else {
-        body = originalResponse.body;
-      }
+
+      const contentType = headers.get("content-type") || "";
+      const body = contentType.includes("text/")
+        ? await replaceResponseText(
+            originalResponse,
+            PROXY_HOSTNAME,
+            env.PATHNAME_REGEX,
+            originHostname
+          )
+        : originalResponse.body;
+
       return new Response(body, {
         status: originalResponse.status,
-        headers: newResponseHeaders,
+        headers,
       });
-    } catch (error) {
-      logError(request, `Fetch error: ${error.message}`);
+    } catch (e) {
+      logError(request, `Fetch error: ${e.message}`);
       return new Response("Internal Server Error", { status: 500 });
     }
   },
