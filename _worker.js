@@ -9,7 +9,7 @@ function logError(request, message) {
 function createNewRequest(request, url, proxyHostname, originHostname) {
   const newRequestHeaders = new Headers(request.headers);
   for (const [key, value] of newRequestHeaders) {
-    if (value.includes(originHostname)) {
+    if (typeof value === "string" && value.includes(originHostname)) {
       newRequestHeaders.set(
         key,
         value.replace(
@@ -23,7 +23,7 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
     method: request.method,
     headers: newRequestHeaders,
     body: request.body,
-    redirect: 'follow'
+    redirect: "follow",
   });
 }
 
@@ -35,7 +35,7 @@ function setResponseHeaders(
 ) {
   const newResponseHeaders = new Headers(originalResponse.headers);
   for (const [key, value] of newResponseHeaders) {
-    if (value.includes(proxyHostname)) {
+    if (typeof value === "string" && value.includes(proxyHostname)) {
       newResponseHeaders.set(
         key,
         value.replace(
@@ -51,14 +51,6 @@ function setResponseHeaders(
   return newResponseHeaders;
 }
 
-/**
- * 替换内容
- * @param originalResponse 响应
- * @param proxyHostname 代理地址 hostname
- * @param pathnameRegex 代理地址路径匹配的正则表达式
- * @param originHostname 替换的字符串
- * @returns {Promise<*>}
- */
 async function replaceResponseText(
   originalResponse,
   proxyHostname,
@@ -95,17 +87,48 @@ font-family: Tahoma, Verdana, Arial, sans-serif; }
 <h1>Welcome to nginx!</h1>
 <p>If you see this page, the nginx web server is successfully installed and
 working. Further configuration is required.</p>
-
-<p>For online documentation and support please refer to
-<a href="http://nginx.org/">nginx.org</a>.<br/>
-Commercial support is available at
-<a href="http://nginx.com/">nginx.com</a>.</p>
-
-<p><em>Thank you for using nginx.</em></p>
 </body>
 </html>`;
 }
 
+/* ===================== WebSocket 代理 ===================== */
+async function handleWebSocket(request, targetUrl) {
+  const pair = new WebSocketPair();
+  const [client, worker] = Object.values(pair);
+
+  worker.accept();
+
+  const target = new WebSocket(targetUrl);
+
+  worker.addEventListener("message", (e) => {
+    if (target.readyState === WebSocket.OPEN) {
+      target.send(e.data);
+    }
+  });
+
+  target.addEventListener("message", (e) => {
+    if (worker.readyState === WebSocket.OPEN) {
+      worker.send(e.data);
+    }
+  });
+
+  const closeBoth = () => {
+    try { worker.close(); } catch {}
+    try { target.close(); } catch {}
+  };
+
+  worker.addEventListener("close", closeBoth);
+  worker.addEventListener("error", closeBoth);
+  target.addEventListener("close", closeBoth);
+  target.addEventListener("error", closeBoth);
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
+}
+
+/* ===================== 主入口 ===================== */
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -123,42 +146,54 @@ export default {
         KEEP_PATH = false,
         DEBUG = false,
       } = env;
+
       const url = new URL(request.url);
       const originHostname = url.hostname;
+
+      /* ============ WebSocket 分支 ============ */
+      const upgrade = request.headers.get("Upgrade");
+      if (upgrade && upgrade.toLowerCase() === "websocket") {
+        url.hostname = PROXY_HOSTNAME;
+        url.protocol = PROXY_PROTOCOL === "http" ? "ws:" : "wss:";
+        return handleWebSocket(request, url.toString());
+      }
+
+      /* ============ 原有 HTTP 校验逻辑（保持不变） ============ */
       if (
         !PROXY_HOSTNAME ||
         (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
         (UA_WHITELIST_REGEX &&
           !new RegExp(UA_WHITELIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
+            request.headers.get("user-agent")?.toLowerCase() || ""
           )) ||
         (UA_BLACKLIST_REGEX &&
           new RegExp(UA_BLACKLIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
+            request.headers.get("user-agent")?.toLowerCase() || ""
           )) ||
         (IP_WHITELIST_REGEX &&
           !new RegExp(IP_WHITELIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
+            request.headers.get("cf-connecting-ip") || ""
           )) ||
         (IP_BLACKLIST_REGEX &&
           new RegExp(IP_BLACKLIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
+            request.headers.get("cf-connecting-ip") || ""
           )) ||
         (REGION_WHITELIST_REGEX &&
           !new RegExp(REGION_WHITELIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
+            request.headers.get("cf-ipcountry") || ""
           )) ||
         (REGION_BLACKLIST_REGEX &&
           new RegExp(REGION_BLACKLIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
+            request.headers.get("cf-ipcountry") || ""
           ))
       ) {
         logError(request, "Invalid");
         return URL302
-          ? Response.redirect(KEEP_PATH
-            ? (URL302 + "/" + url.pathname).replace(/\/+/g, '/')
-            : URL302,
-             302
+          ? Response.redirect(
+              KEEP_PATH
+                ? (URL302 + "/" + url.pathname).replace(/\/+/g, "/")
+                : URL302,
+              302
             )
           : new Response(await nginx(), {
               headers: {
@@ -166,23 +201,30 @@ export default {
               },
             });
       }
+
+      /* ============ 原有 HTTP 代理逻辑 ============ */
       url.host = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
+
       const newRequest = createNewRequest(
         request,
         url,
         PROXY_HOSTNAME,
         originHostname
       );
+
       const originalResponse = await fetch(newRequest);
+
       const newResponseHeaders = setResponseHeaders(
         originalResponse,
         PROXY_HOSTNAME,
         originHostname,
         DEBUG
       );
+
       const contentType = newResponseHeaders.get("content-type") || "";
       let body;
+
       if (contentType.includes("text/")) {
         body = await replaceResponseText(
           originalResponse,
@@ -193,6 +235,7 @@ export default {
       } else {
         body = originalResponse.body;
       }
+
       return new Response(body, {
         status: originalResponse.status,
         headers: newResponseHeaders,
